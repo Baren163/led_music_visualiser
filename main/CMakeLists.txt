@@ -1,5 +1,10 @@
-idf_component_register(SRCS "blink_example_main.c"
+idf_component_register(SRCS "main.c"
+                            "renderer.c"
+                            "storage.c"
+                            "control.c"
+                            "ble.c"
                        INCLUDE_DIRS "."
-                       REQUIRES spiffs esp_timer)
+                       REQUIRES bt nvs_flash esp_timer vfs)
 
-spiffs_create_partition_image(storage ../storage FLASH_IN_PROJECT)
+# Songs are no longer flashed with the firmware: the laptop sends them
+# over BLE and they are cached on the LittleFS "storage" partition.

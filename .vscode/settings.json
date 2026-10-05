@@ -22,7 +22,6 @@
   "idf.openOcdConfigs": [
     "board/esp32c3-builtin.cfg"
   ],
-  "idf.portWin": "COM4",
   "idf.currentSetup": "C:\\Users\\beren\\esp\\v5.5.1\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32c3"
@@ -33,5 +32,6 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\beren\\ledStrip_project\\build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.port": "COM4"
 }

@@ -2,16 +2,26 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_timer.h"
-#include "esp_spiffs.h"
 
 #include "led_strip.h"
+
+#include "renderer.h"
+#include "storage.h"
+
+
+#if CONFIG_FREERTOS_HZ < 1000
+#warning "Set CONFIG_FREERTOS_HZ=1000 for accurate frame timing (see sdkconfig.defaults)"
+#endif
 
 
 // ============================================================
@@ -20,16 +30,21 @@
 
 #define LED_GPIO            0
 #define LED_COUNT           144
+#define LED_HALF            (LED_COUNT / 2)
 
-#define FRAME_RATE_HZ       25
-#define FRAME_PERIOD_US     (1000000 / FRAME_RATE_HZ)
+#define FRAME_PERIOD_US     (FRAME_PERIOD_MS * 1000)
 
-#define STORAGE_PATH        "/storage"
-#define STORAGE_PARTITION   "storage"
-#define SONG_PATH           "/storage/song.bin"
+#define RENDERER_TASK_PRIORITY  10      // highest of the application tasks
+#define RENDERER_TASK_STACK     4096
+#define RENDERER_QUEUE_LENGTH   4
+
+// If the renderer falls more than this many frames behind the clock
+// (e.g. a flash write stalled the CPU) it skips ahead instead of
+// racing through the backlog.
+#define MAX_LATE_FRAMES     2
 
 
-static const char *TAG = "audio_visualiser";
+static const char *TAG = "renderer";
 
 static led_strip_handle_t led_strip;
 
@@ -76,6 +91,22 @@ static led_strip_handle_t led_strip;
 #define DRUM_BRIGHTNESS      60
 #define OTHER_BRIGHTNESS     120
 #define VOCAL_BRIGHTNESS     30
+
+
+// ============================================================
+// IDLE / TRANSFER ANIMATIONS
+// ============================================================
+
+// Idle: slow warm wave travelling along the strip (mirrored).
+#define IDLE_BRIGHTNESS      40
+#define IDLE_WAVES           2.0f       // wave crests per half strip
+#define IDLE_SPEED           1.2f       // radians per second
+
+// Transfer: progress bar filling from both ends toward the centre.
+#define TRANSFER_BRIGHTNESS  40
+
+#define TWO_PI               6.2831853f
+
 
 // ============================================================
 // LED REGIONS
@@ -180,7 +211,7 @@ typedef struct
 
 
 _Static_assert(
-    sizeof(audio_frame_t) == 14,
+    sizeof(audio_frame_t) == AUDIO_FRAME_SIZE,
     "audio_frame_t must be exactly 14 bytes"
 );
 
@@ -232,6 +263,55 @@ static rgb_t led_buffer[LED_COUNT];
 
 
 // ============================================================
+// RENDER TASK STATE
+// ============================================================
+
+typedef enum
+{
+    RCMD_OPEN,
+    RCMD_SEEK,
+    RCMD_PAUSE,
+    RCMD_RESUME,
+    RCMD_IDLE,
+    RCMD_OFF,
+    RCMD_TRANSFER,
+
+} rcmd_type_t;
+
+
+typedef struct
+{
+    rcmd_type_t type;
+    uint32_t frame;
+    bool playing;
+    char track_id[TRACK_ID_LEN];
+
+} rcmd_t;
+
+
+static QueueHandle_t s_cmd_queue;
+static SemaphoreHandle_t s_cmd_done;
+static bool s_cmd_result;
+
+static volatile renderer_mode_t s_mode = RENDERER_OFF;
+
+// Open song file and playback position.
+static FILE *s_file = NULL;
+static uint32_t s_total_frames = 0;
+static volatile uint32_t s_frame = 0;
+static char s_loaded_track[TRACK_ID_LEN];
+
+// Timing anchor: s_anchor_frame is due at s_anchor_time_us.
+static int64_t s_anchor_time_us = 0;
+static uint32_t s_anchor_frame = 0;
+
+// Idle / transfer animation timing.
+static int64_t s_anim_start_us = 0;
+static uint32_t s_anim_frame = 0;
+static volatile uint8_t s_progress = 0;
+
+
+// ============================================================
 // LED INITIALISATION
 // ============================================================
 
@@ -277,58 +357,6 @@ static void configure_led(void)
 
     ESP_ERROR_CHECK(
         led_strip_clear(led_strip)
-    );
-}
-
-
-// ============================================================
-// SPIFFS STORAGE
-// ============================================================
-
-static void configure_storage(void)
-{
-    esp_vfs_spiffs_conf_t config = {
-        .base_path = STORAGE_PATH,
-        .partition_label = STORAGE_PARTITION,
-        .max_files = 4,
-        .format_if_mount_failed = false,
-    };
-
-
-    esp_err_t result =
-        esp_vfs_spiffs_register(&config);
-
-
-    if (result != ESP_OK)
-    {
-        ESP_LOGE(
-            TAG,
-            "Failed to mount SPIFFS: %s",
-            esp_err_to_name(result)
-        );
-
-        return;
-    }
-
-
-    size_t total = 0;
-    size_t used = 0;
-
-
-    ESP_ERROR_CHECK(
-        esp_spiffs_info(
-            STORAGE_PARTITION,
-            &total,
-            &used
-        )
-    );
-
-
-    ESP_LOGI(
-        TAG,
-        "SPIFFS mounted: %u / %u bytes used",
-        (unsigned int)used,
-        (unsigned int)total
     );
 }
 
@@ -429,6 +457,13 @@ static void send_led_buffer(void)
     ESP_ERROR_CHECK(
         led_strip_refresh(led_strip)
     );
+}
+
+
+static void clear_strip(void)
+{
+    clear_led_buffer();
+    send_led_buffer();
 }
 
 
@@ -760,7 +795,7 @@ static void render_vocals(
     for (int i = 0; i < leds_on; i++)
     {
         set_mirrored_led(
-            VOCAL_START + i,
+            VOCAL_END - i,
             ((uint16_t)VOCAL_R * VOCAL_BRIGHTNESS) / 255,
             ((uint16_t)VOCAL_G * VOCAL_BRIGHTNESS) / 255,
             ((uint16_t)VOCAL_B * VOCAL_BRIGHTNESS) / 255
@@ -813,209 +848,502 @@ static void render_frame(
 
 
 // ============================================================
-// PLAY SONG VISUALISATION
+// IDLE AND TRANSFER ANIMATIONS
 // ============================================================
 
-static void play_song(void)
+static void render_idle_animation(int64_t elapsed_us)
 {
-    FILE *file =
-        fopen(
-            SONG_PATH,
-            "rb"
-        );
+    clear_led_buffer();
 
+    float t = (float)elapsed_us / 1000000.0f;
 
-    if (file == NULL)
+    for (int i = 0; i < LED_HALF; i++)
     {
-        ESP_LOGE(
-            TAG,
-            "Could not open %s",
-            SONG_PATH
-        );
+        float phase =
+            ((float)i / LED_HALF) * TWO_PI * IDLE_WAVES -
+            t * IDLE_SPEED;
 
-        return;
-    }
+        // Sharpen the sine so the crests read as soft blobs.
+        float v = 0.5f + 0.5f * sinf(phase);
+        v = v * v * v;
 
+        uint8_t level = (uint8_t)(v * IDLE_BRIGHTNESS);
 
-    // --------------------------------------------------------
-    // Determine file size and number of frames
-    // --------------------------------------------------------
-
-    fseek(
-        file,
-        0,
-        SEEK_END
-    );
-
-
-    long file_size =
-        ftell(file);
-
-
-    rewind(file);
-
-
-    if (
-        file_size %
-        sizeof(audio_frame_t)
-        != 0
-    )
-    {
-        ESP_LOGW(
-            TAG,
-            "File size is not a multiple of 12 bytes"
+        set_mirrored_led(
+            i,
+            ((uint16_t)OTHER_R * level) / 255,
+            ((uint16_t)OTHER_G * level) / 255,
+            ((uint16_t)OTHER_B * level) / 255
         );
     }
 
-
-    uint32_t total_frames =
-        file_size /
-        sizeof(audio_frame_t);
+    send_led_buffer();
+}
 
 
-    ESP_LOGI(
-        TAG,
-        "Song file: %ld bytes",
-        file_size
-    );
+static void render_transfer_animation(int64_t elapsed_us)
+{
+    clear_led_buffer();
+
+    int filled = ((int)s_progress * LED_HALF) / 100;
+
+    if (filled > LED_HALF)
+        filled = LED_HALF;
+
+    for (int i = 0; i < filled; i++)
+    {
+        set_mirrored_led(
+            i,
+            ((uint16_t)VOCAL_R * TRANSFER_BRIGHTNESS) / 255,
+            ((uint16_t)VOCAL_G * TRANSFER_BRIGHTNESS) / 255,
+            ((uint16_t)VOCAL_B * TRANSFER_BRIGHTNESS) / 255
+        );
+    }
+
+    // Pulsing head so a stalled transfer is still visibly "alive".
+    if (filled < LED_HALF)
+    {
+        float t = (float)elapsed_us / 1000000.0f;
+        float pulse = 0.5f + 0.5f * sinf(t * TWO_PI * 1.5f);
+        uint8_t level = (uint8_t)(pulse * TRANSFER_BRIGHTNESS);
+
+        set_mirrored_led(
+            filled,
+            ((uint16_t)VOCAL_R * level) / 255,
+            ((uint16_t)VOCAL_G * level) / 255,
+            ((uint16_t)VOCAL_B * level) / 255
+        );
+    }
+
+    send_led_buffer();
+}
 
 
-    ESP_LOGI(
-        TAG,
-        "Frames: %lu",
-        (unsigned long)total_frames
-    );
+// ============================================================
+// PLAYBACK HELPERS
+// ============================================================
 
-
-    ESP_LOGI(
-        TAG,
-        "Starting visualisation"
-    );
-
-
-    // Reset drum fade state.
-
+static void reset_visual_state(void)
+{
     kick_brightness = 0;
     hihat_brightness = 0;
+
     memset(
         other_led_brightness,
         0,
         sizeof(other_led_brightness)
     );
+}
 
 
-    audio_frame_t frame;
-
-    uint32_t frame_number = 0;
-
-
-    int64_t start_time =
-        esp_timer_get_time();
-
-
-    // ========================================================
-    // MAIN PLAYBACK LOOP
-    // ========================================================
-
-    while (
-        fread(
-            &frame,
-            sizeof(frame),
-            1,
-            file
-        ) == 1
-    )
+static void close_file(void)
+{
+    if (s_file != NULL)
     {
-        // Absolute timestamp for this frame.
-
-        int64_t target_time =
-            start_time +
-            (
-                (int64_t)frame_number *
-                FRAME_PERIOD_US
-            );
-
-
-        // ----------------------------------------------------
-        // Wait for correct frame time
-        // ----------------------------------------------------
-
-        while (true)
-        {
-            int64_t now =
-                esp_timer_get_time();
-
-
-            int64_t remaining =
-                target_time - now;
-
-
-            if (remaining <= 0)
-                break;
-
-
-            // Sleep for most of long waits.
-
-            if (remaining > 3000)
-            {
-                vTaskDelay(
-                    pdMS_TO_TICKS(1)
-                );
-            }
-            else
-            {
-                // Very short remaining time.
-
-                taskYIELD();
-            }
-        }
-
-
-        // ----------------------------------------------------
-        // Render this frame
-        // ----------------------------------------------------
-
-        render_frame(
-            &frame
-        );
-
-
-        frame_number++;
+        fclose(s_file);
+        s_file = NULL;
     }
 
+    memset(s_loaded_track, 0, sizeof(s_loaded_track));
+    s_total_frames = 0;
+    s_frame = 0;
+}
 
-    fclose(file);
+
+static void start_animation(renderer_mode_t mode)
+{
+    s_mode = mode;
+    s_anim_start_us = esp_timer_get_time();
+    s_anim_frame = 0;
+}
 
 
-    ESP_ERROR_CHECK(
-        led_strip_clear(led_strip)
-    );
+// Moves the open file to `frame` and re-anchors the frame clock so
+// `frame` is displayed immediately. Fade state is reset because the
+// previous frames no longer lead into this one.
+static void position_playback(uint32_t frame, bool playing)
+{
+    reset_visual_state();
 
+    if (frame >= s_total_frames ||
+        fseek(s_file, (long)frame * AUDIO_FRAME_SIZE, SEEK_SET) != 0)
+    {
+        s_frame = s_total_frames;
+        s_mode = RENDERER_ENDED;
+        clear_strip();
+        return;
+    }
+
+    s_frame = frame;
+    s_anchor_frame = frame;
+    s_anchor_time_us = esp_timer_get_time();
+
+    if (playing)
+    {
+        s_mode = RENDERER_PLAYING;
+    }
+    else
+    {
+        s_mode = RENDERER_PAUSED;
+        clear_strip();
+    }
+}
+
+
+static bool open_track(const rcmd_t *cmd)
+{
+    close_file();
+
+    char path[48];
+    storage_track_path(cmd->track_id, path, sizeof(path));
+
+    s_file = fopen(path, "rb");
+
+    if (s_file == NULL)
+    {
+        ESP_LOGE(TAG, "Could not open %s", path);
+        s_mode = RENDERER_OFF;
+        clear_strip();
+        return false;
+    }
+
+    fseek(s_file, 0, SEEK_END);
+    long file_size = ftell(s_file);
+
+    if (file_size % AUDIO_FRAME_SIZE != 0)
+    {
+        ESP_LOGW(
+            TAG,
+            "File size is not a multiple of %d bytes",
+            AUDIO_FRAME_SIZE
+        );
+    }
+
+    s_total_frames = file_size / AUDIO_FRAME_SIZE;
+    memcpy(s_loaded_track, cmd->track_id, TRACK_ID_LEN);
 
     ESP_LOGI(
         TAG,
-        "Visualisation finished"
+        "Opened %.22s: %lu frames, starting at frame %lu (%s)",
+        cmd->track_id,
+        (unsigned long)s_total_frames,
+        (unsigned long)cmd->frame,
+        cmd->playing ? "playing" : "paused"
     );
+
+    position_playback(cmd->frame, cmd->playing);
+    return true;
 }
 
 
 // ============================================================
-// MAIN
+// COMMAND HANDLING
 // ============================================================
 
-void app_main(void)
+static bool handle_command(const rcmd_t *cmd)
 {
-    ESP_LOGI(
-        TAG,
-        "Starting Audio Visualiser"
-    );
+    switch (cmd->type)
+    {
+    case RCMD_OPEN:
+        return open_track(cmd);
+
+    case RCMD_SEEK:
+    case RCMD_RESUME:
+        if (s_file == NULL)
+            return false;
+
+        position_playback(cmd->frame, true);
+        return true;
+
+    case RCMD_PAUSE:
+        if (s_mode == RENDERER_PLAYING)
+        {
+            s_mode = RENDERER_PAUSED;
+            clear_strip();
+        }
+        return true;
+
+    case RCMD_IDLE:
+        if (s_mode != RENDERER_IDLE)
+        {
+            close_file();
+            start_animation(RENDERER_IDLE);
+        }
+        return true;
+
+    case RCMD_TRANSFER:
+        close_file();
+        s_progress = 0;
+        start_animation(RENDERER_TRANSFER);
+        return true;
+
+    case RCMD_OFF:
+        close_file();
+        s_mode = RENDERER_OFF;
+        clear_strip();
+        return true;
+    }
+
+    return false;
+}
 
 
+// ============================================================
+// RENDER TASK
+// ============================================================
+
+// Absolute time of the next piece of work, or -1 if there is none.
+static int64_t next_deadline_us(void)
+{
+    switch (s_mode)
+    {
+    case RENDERER_PLAYING:
+        return s_anchor_time_us +
+               (int64_t)(s_frame - s_anchor_frame) * FRAME_PERIOD_US;
+
+    case RENDERER_IDLE:
+    case RENDERER_TRANSFER:
+        return s_anim_start_us +
+               (int64_t)s_anim_frame * FRAME_PERIOD_US;
+
+    default:
+        return -1;
+    }
+}
+
+
+static void play_next_frame(void)
+{
+    int64_t now = esp_timer_get_time();
+
+    // Skip ahead if we fell badly behind instead of fast-forwarding.
+    uint32_t due =
+        s_anchor_frame +
+        (uint32_t)((now - s_anchor_time_us) / FRAME_PERIOD_US);
+
+    if (due > s_frame + MAX_LATE_FRAMES)
+    {
+        ESP_LOGW(
+            TAG,
+            "Renderer %lu frames late, skipping ahead",
+            (unsigned long)(due - s_frame)
+        );
+
+        if (due >= s_total_frames ||
+            fseek(s_file, (long)due * AUDIO_FRAME_SIZE, SEEK_SET) != 0)
+        {
+            s_frame = s_total_frames;
+            s_mode = RENDERER_ENDED;
+            clear_strip();
+            return;
+        }
+
+        s_frame = due;
+    }
+
+    audio_frame_t frame;
+
+    if (fread(&frame, sizeof(frame), 1, s_file) != 1)
+    {
+        ESP_LOGI(TAG, "Visualisation finished");
+        s_mode = RENDERER_ENDED;
+        clear_strip();
+        return;
+    }
+
+    render_frame(&frame);
+    s_frame++;
+}
+
+
+static void play_next_animation_frame(void)
+{
+    int64_t elapsed = esp_timer_get_time() - s_anim_start_us;
+
+    if (s_mode == RENDERER_IDLE)
+        render_idle_animation(elapsed);
+    else
+        render_transfer_animation(elapsed);
+
+    s_anim_frame++;
+
+    // After a long stall (flash erase) resynchronise instead of
+    // rendering a burst of catch-up frames.
+    uint32_t due = (uint32_t)(elapsed / FRAME_PERIOD_US);
+
+    if (due > s_anim_frame + MAX_LATE_FRAMES)
+        s_anim_frame = due + 1;
+}
+
+
+static void renderer_task(void *arg)
+{
+    rcmd_t cmd;
+
+    for (;;)
+    {
+        // ----------------------------------------------------
+        // Sleep on the command queue until the next frame is due.
+        // ----------------------------------------------------
+
+        int64_t deadline = next_deadline_us();
+        TickType_t wait_ticks;
+
+        if (deadline < 0)
+        {
+            wait_ticks = portMAX_DELAY;
+        }
+        else
+        {
+            int64_t remaining = deadline - esp_timer_get_time();
+
+            wait_ticks = (remaining > 0)
+                ? (TickType_t)((remaining * configTICK_RATE_HZ) / 1000000)
+                : 0;
+        }
+
+        if (xQueueReceive(s_cmd_queue, &cmd, wait_ticks) == pdTRUE)
+        {
+            s_cmd_result = handle_command(&cmd);
+            xSemaphoreGive(s_cmd_done);
+            continue;
+        }
+
+        if (deadline < 0)
+            continue;
+
+        // ----------------------------------------------------
+        // Less than one tick left: spin for the remainder.
+        // ----------------------------------------------------
+
+        while (esp_timer_get_time() < deadline)
+        {
+        }
+
+        if (s_mode == RENDERER_PLAYING)
+            play_next_frame();
+        else
+            play_next_animation_frame();
+    }
+}
+
+
+// ============================================================
+// PUBLIC API
+// ============================================================
+
+static bool send_command(const rcmd_t *cmd)
+{
+    xQueueSend(s_cmd_queue, cmd, portMAX_DELAY);
+
+    if (xSemaphoreTake(s_cmd_done, pdMS_TO_TICKS(2000)) != pdTRUE)
+    {
+        ESP_LOGE(TAG, "Render task did not acknowledge command %d", cmd->type);
+        return false;
+    }
+
+    return s_cmd_result;
+}
+
+
+void renderer_init(void)
+{
     configure_led();
 
+    s_cmd_queue = xQueueCreate(RENDERER_QUEUE_LENGTH, sizeof(rcmd_t));
+    s_cmd_done = xSemaphoreCreateBinary();
 
-    configure_storage();
+    configASSERT(s_cmd_queue != NULL);
+    configASSERT(s_cmd_done != NULL);
+
+    xTaskCreate(
+        renderer_task,
+        "renderer",
+        RENDERER_TASK_STACK,
+        NULL,
+        RENDERER_TASK_PRIORITY,
+        NULL
+    );
+}
 
 
-    play_song();
+bool renderer_open(const char *track_id, uint32_t start_frame, bool playing)
+{
+    rcmd_t cmd = {
+        .type = RCMD_OPEN,
+        .frame = start_frame,
+        .playing = playing,
+    };
+
+    memcpy(cmd.track_id, track_id, TRACK_ID_LEN);
+
+    return send_command(&cmd);
+}
+
+
+void renderer_seek(uint32_t frame)
+{
+    rcmd_t cmd = { .type = RCMD_SEEK, .frame = frame };
+    send_command(&cmd);
+}
+
+
+void renderer_pause(void)
+{
+    rcmd_t cmd = { .type = RCMD_PAUSE };
+    send_command(&cmd);
+}
+
+
+void renderer_resume(uint32_t frame)
+{
+    rcmd_t cmd = { .type = RCMD_RESUME, .frame = frame };
+    send_command(&cmd);
+}
+
+
+void renderer_idle(void)
+{
+    rcmd_t cmd = { .type = RCMD_IDLE };
+    send_command(&cmd);
+}
+
+
+void renderer_off(void)
+{
+    rcmd_t cmd = { .type = RCMD_OFF };
+    send_command(&cmd);
+}
+
+
+void renderer_show_transfer(void)
+{
+    rcmd_t cmd = { .type = RCMD_TRANSFER };
+    send_command(&cmd);
+}
+
+
+void renderer_set_progress(uint8_t percent)
+{
+    s_progress = (percent > 100) ? 100 : percent;
+}
+
+
+renderer_mode_t renderer_get_mode(void)
+{
+    return s_mode;
+}
+
+
+uint32_t renderer_get_frame(void)
+{
+    return s_frame;
+}
+
+
+void renderer_get_loaded_track(char out[TRACK_ID_LEN])
+{
+    // Only modified by the render task while it processes a command,
+    // and commands are synchronous, so this is stable for the caller.
+    memcpy(out, s_loaded_track, TRACK_ID_LEN);
 }
