@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -39,9 +40,16 @@
 #define RENDERER_QUEUE_LENGTH   4
 
 // If the renderer falls more than this many frames behind the clock
-// (e.g. a flash write stalled the CPU) it skips ahead instead of
-// racing through the backlog.
+// (e.g. a flash write stalled the CPU) it catches up without drawing
+// the missed frames instead of racing through the backlog.
 #define MAX_LATE_FRAMES     2
+
+// Larger gaps than this are handled as a full seek.
+#define MAX_CATCH_UP_FRAMES 50
+
+// After a seek, the drums are rebuilt by replaying this many frames
+// (2 s, matching led_strip_visualizer.py).
+#define DRUM_REPLAY_FRAMES  (FRAME_RATE_HZ * 2)
 
 
 static const char *TAG = "renderer";
@@ -53,7 +61,7 @@ static led_strip_handle_t led_strip;
 // LED COLOURS
 // ============================================================
 
-// These can be adjusted later.
+// Vocal and Other colours now come from the song file.
 
 #define BASS_R      255
 #define BASS_G      0
@@ -62,14 +70,6 @@ static led_strip_handle_t led_strip;
 #define DRUM_R      255
 #define DRUM_G      65
 #define DRUM_B      0
-
-#define OTHER_R     200
-#define OTHER_G     110
-#define OTHER_B     0
-
-#define VOCAL_R     180
-#define VOCAL_G     220
-#define VOCAL_B     0
 
 
 
@@ -98,54 +98,46 @@ static led_strip_handle_t led_strip;
 // ============================================================
 
 // Idle: slow warm wave travelling along the strip (mirrored).
+#define IDLE_R               200
+#define IDLE_G               110
+#define IDLE_B               0
 #define IDLE_BRIGHTNESS      40
 #define IDLE_WAVES           2.0f       // wave crests per half strip
 #define IDLE_SPEED           1.2f       // radians per second
 
 // Transfer: progress bar filling from both ends toward the centre.
+#define TRANSFER_R           180
+#define TRANSFER_G           220
+#define TRANSFER_B           0
 #define TRANSFER_BRIGHTNESS  40
 
 #define TWO_PI               6.2831853f
 
 
 // ============================================================
-// LED REGIONS
+// LED REGIONS (not mirrored)
 //
-// FIRST HALF:
 //  0  - 17     Bass
 //  18 - 26     Kick
 //  27 - 35     Hi-hat
-//  36 - 37     Gap before Other
-//  38 - 57     Other main note-position region
-//  58 - 59     Gap after Other
-//  60 - 71     Vocal spectrum
-//
-// SECOND HALF:
-// mirrored automatically
+//  36          Gap
+//  37 - 84     Other (48 LEDs, note position p -> LED 37 + p)
+//  85          Gap
+//  86 - 143    Vocals
 // ============================================================
 
 #define BASS_START          0
 #define BASS_END            17
 
 #define KICK_START          18
-#define KICK_END            26
-
 #define HIHAT_START         27
-#define HIHAT_END           35
+#define DRUM_BLOCK_LENGTH   9
 
-#define OTHER_MAIN_START    38
-#define OTHER_MAIN_END      57
+#define OTHER_START         37
+#define OTHER_LED_COUNT     48
 
-// The Other glow is allowed to occupy one LED beyond the main region on
-// each side. This uses one LED from each 2-LED positional gap, leaving
-// one physically dark LED between Other and the neighbouring component.
-#define OTHER_RENDER_START  (OTHER_MAIN_START - 1)
-#define OTHER_RENDER_END    (OTHER_MAIN_END + 1)
-#define OTHER_RENDER_LENGTH (OTHER_RENDER_END - OTHER_RENDER_START + 1)
-#define OTHER_MAIN_LENGTH   (OTHER_MAIN_END - OTHER_MAIN_START + 1)
-
-#define VOCAL_START         60
-#define VOCAL_END           71
+#define VOCAL_START         86
+#define VOCAL_END           143
 
 #define VOCALS_VOLUME_LOWER_THRESHOLD 153
 #define VOCALS_VOLUME_UPPER_THRESHOLD 230
@@ -166,54 +158,48 @@ static led_strip_handle_t led_strip;
 // Drum spatial brightness profile across each 9-LED block.
 // Values are 0-255 multipliers applied to the current beat brightness.
 // The centre stays bright while the three LEDs toward each edge taper off.
-static const uint8_t DRUM_LED_PROFILE[9] = {
+static const uint8_t DRUM_LED_PROFILE[DRUM_BLOCK_LENGTH] = {
     0, 64, 140, 255, 255, 255, 140, 64, 0
 };
 
-// 'Other' note fade. Amount removed from every active other LED per frame.
-#define OTHER_FADE_AMOUNT      45
 
-// Adjacent LEDs receive this fraction of the main note brightness.
-// 64 / 255 ~= 25%.
-#define OTHER_ADJACENT_SCALE   64
+// ============================================================
+// OTHER NOTE STATE
+// ============================================================
+
+// Other brightness is 0-255 scaled by 256 so slow fades stay smooth.
+#define OTHER_FULL_LEVEL       (255 << 8)
 
 
 // ============================================================
-// BINARY FILE FORMAT
-//
-// 14 bytes per frame:
-//
-// byte 0        bass
-// byte 1        drums
-// byte 2        other brightness (0-255)
-// byte 3        other metadata:
-//                 bit 0      note detected
-//                 bits 1-4   LED position (0-13)
-//                 bits 5-7   reserved
-// bytes 4-11   vocals_spectrum[8]
-// byte 12       vocals_volume
-// byte 13       vocals_onset
+// SONG FILE RECORDS (see protocol.h for the container layout)
 // ============================================================
 
-typedef struct
+typedef struct __attribute__((packed))
 {
     uint8_t bass;
     uint8_t drums;
+    uint16_t vocal_colour;      // RGB555
+    uint8_t vocal_volume;
+    uint8_t vocal_onset;
 
-    uint8_t other_brightness;
-    uint8_t other_metadata;
-
-    uint8_t vocals_spectrum[8];
-    uint8_t vocals_volume;
-    uint8_t vocals_onset;
-
-} audio_frame_t;
+} song_frame_t;
 
 
-_Static_assert(
-    sizeof(audio_frame_t) == AUDIO_FRAME_SIZE,
-    "audio_frame_t must be exactly 14 bytes"
-);
+typedef struct __attribute__((packed))
+{
+    uint16_t frame;
+    uint8_t position;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    uint8_t fade;
+
+} song_note_t;
+
+
+_Static_assert(sizeof(song_frame_t) == SONG_FRAME_SIZE, "song_frame_t must be 6 bytes");
+_Static_assert(sizeof(song_note_t) == SONG_NOTE_SIZE, "song_note_t must be 7 bytes");
 
 
 // ============================================================
@@ -240,12 +226,6 @@ static uint8_t kick_brightness = 0;
 static uint8_t hihat_brightness = 0;
 
 
-// Persistent brightness for the Other render region, including one glow LED
-// into each reserved positional gap. This lets previous notes fade while new
-// notes can appear elsewhere without touching drums or vocals.
-static uint8_t other_led_brightness[OTHER_RENDER_LENGTH] = {0};
-
-
 // ============================================================
 // LED FRAMEBUFFER
 // ============================================================
@@ -262,6 +242,13 @@ typedef struct
 static rgb_t led_buffer[LED_COUNT];
 
 
+// Per-LED Other state. Each LED keeps the colour and fade of the
+// last note that lit it.
+static uint16_t other_level[OTHER_LED_COUNT];
+static rgb_t other_colour[OTHER_LED_COUNT];
+static uint8_t other_fade[OTHER_LED_COUNT];
+
+
 // ============================================================
 // RENDER TASK STATE
 // ============================================================
@@ -270,6 +257,7 @@ typedef enum
 {
     RCMD_OPEN,
     RCMD_SEEK,
+    RCMD_STILL,
     RCMD_PAUSE,
     RCMD_RESUME,
     RCMD_IDLE,
@@ -295,9 +283,12 @@ static bool s_cmd_result;
 
 static volatile renderer_mode_t s_mode = RENDERER_OFF;
 
-// Open song file and playback position.
+// Open song. Frames are streamed from the file; notes live in RAM.
 static FILE *s_file = NULL;
 static uint32_t s_total_frames = 0;
+static uint8_t *s_notes = NULL;
+static uint32_t s_note_count = 0;
+static uint32_t s_next_note = 0;            // first note not yet applied
 static volatile uint32_t s_frame = 0;
 static char s_loaded_track[TRACK_ID_LEN];
 
@@ -398,12 +389,8 @@ static void set_physical_led(
 
 // ------------------------------------------------------------
 // Set an LED on the first half AND its mirrored LED.
-//
-// Example:
-//
-// LED 0  -> also LED 143
-// LED 17 -> also LED 126
-// LED 71 -> also LED 72
+// Only used by the idle and transfer animations; song frames
+// are not mirrored.
 // ------------------------------------------------------------
 
 static void set_mirrored_led(
@@ -504,7 +491,8 @@ static drum_data_t decode_drums(uint8_t drums)
 // BASS
 // ============================================================
 //
-// Bass value determines NUMBER of illuminated LEDs.
+// Bass value determines NUMBER of illuminated LEDs, filling
+// upward from LED 0.
 //
 // bass = 0
 //
@@ -517,8 +505,6 @@ static drum_data_t decode_drums(uint8_t drums)
 // bass = 255
 //
 //  [##################]
-//
-// This is mirrored on the second half.
 // ============================================================
 
 static void render_bass(uint8_t bass)
@@ -531,15 +517,9 @@ static void render_bass(uint8_t bass)
         ((int)bass * region_length) / 255;
 
 
-    // Make 255 definitely produce all 18 LEDs.
-
-    if (bass == 255)
-        leds_on = region_length;
-
-
     for (int i = 0; i < leds_on; i++)
     {
-        set_mirrored_led(
+        set_physical_led(
             BASS_START + i,
             ((uint16_t)BASS_R * BASS_BRIGHTNESS) / 255,
             ((uint16_t)BASS_G * BASS_BRIGHTNESS) / 255,
@@ -580,38 +560,8 @@ static uint8_t fade_value(
 // After a beat, brightness decreases every frame.
 // ============================================================
 
-static void render_drum_block(
-    int region_start,
-    uint8_t brightness
-)
-{
-    for (int offset = 0; offset < 9; offset++)
-    {
-        uint8_t spatial_level =
-            ((uint32_t)brightness *
-             DRUM_LED_PROFILE[offset] *
-             DRUM_BRIGHTNESS) / (255u * 255u);
-
-        uint8_t r =
-            ((uint16_t)DRUM_R * spatial_level) / 255;
-
-        uint8_t g =
-            ((uint16_t)DRUM_G * spatial_level) / 255;
-
-        uint8_t b =
-            ((uint16_t)DRUM_B * spatial_level) / 255;
-
-        set_mirrored_led(
-            region_start + offset,
-            r,
-            g,
-            b
-        );
-    }
-}
-
-
-static void render_drums(drum_data_t drums)
+// Advances the drum fade state by one frame without drawing.
+static void update_drums(drum_data_t drums)
 {
     // Fade previous beats.
     kick_brightness =
@@ -645,7 +595,42 @@ static void render_drums(drum_data_t drums)
         if (new_brightness > hihat_brightness)
             hihat_brightness = new_brightness;
     }
+}
 
+
+static void render_drum_block(
+    int region_start,
+    uint8_t brightness
+)
+{
+    for (int offset = 0; offset < DRUM_BLOCK_LENGTH; offset++)
+    {
+        uint8_t spatial_level =
+            ((uint32_t)brightness *
+             DRUM_LED_PROFILE[offset] *
+             DRUM_BRIGHTNESS) / (255u * 255u);
+
+        uint8_t r =
+            ((uint16_t)DRUM_R * spatial_level) / 255;
+
+        uint8_t g =
+            ((uint16_t)DRUM_G * spatial_level) / 255;
+
+        uint8_t b =
+            ((uint16_t)DRUM_B * spatial_level) / 255;
+
+        set_physical_led(
+            region_start + offset,
+            r,
+            g,
+            b
+        );
+    }
+}
+
+
+static void render_drums(void)
+{
     render_drum_block(
         KICK_START,
         kick_brightness
@@ -658,114 +643,193 @@ static void render_drums(drum_data_t drums)
 }
 
 
-
 // ============================================================
 // OTHER NOTE EVENTS
 // ============================================================
 //
-// Binary data:
-//   brightness      = 0-255
-//   metadata bit 0  = note detected
-//   metadata 1-4    = one of 14 note positions (0-13)
+// Notes are a separate list sorted by frame, loaded into RAM when
+// a song opens. s_next_note points at the first note not yet
+// applied, so each frame only compares one note's frame with the
+// current frame.
 //
-// The 14 logical positions are spread across 20 main-position LEDs.
-// A detected note lights the selected LED at full brightness and its
-// immediate neighbours at OTHER_ADJACENT_SCALE. The glow may extend one LED
-// into either reserved 2-LED gap, so one dark LED always remains between
-// Other and the neighbouring drum/vocal component.
+// Each of the 48 Other LEDs keeps its own level, colour and fade.
+// Every frame, in this order:
+//   1. Fade:  level = level * (255 - fade) / 255
+//   2. Notes: a note sets its LED to full level, its colour and fade
+//   3. Draw:  LED 37 + p = colour * level, times OTHER_BRIGHTNESS
+// fade 0 holds an LED until another note replaces it.
 // ============================================================
 
-static int other_position_to_led(uint8_t position)
+// 7-byte records are not aligned, so copy them out.
+static void read_note(uint32_t index, song_note_t *note)
 {
-    if (position > 13)
-        position = 13;
-
-    // Map 0..13 evenly onto the 20-LED MAIN region, rounded to the nearest
-    // LED, then offset by one because index 0 of other_led_brightness is the
-    // left-side glow LED in the reserved gap.
-    int main_offset =
-        ((int)position * (OTHER_MAIN_LENGTH - 1) + 6) / 13;
-
-    return main_offset + 1;
+    memcpy(note, s_notes + index * SONG_NOTE_SIZE, SONG_NOTE_SIZE);
 }
 
 
-static void raise_other_led(
-    int offset,
-    uint8_t brightness
-)
+static uint16_t note_frame(uint32_t index)
 {
-    if (offset < 0 || offset >= OTHER_RENDER_LENGTH)
-        return;
-
-    if (brightness > other_led_brightness[offset])
-        other_led_brightness[offset] = brightness;
+    uint16_t frame;
+    memcpy(&frame, s_notes + index * SONG_NOTE_SIZE, sizeof(frame));
+    return frame;
 }
 
 
-static void render_other(
-    uint8_t brightness,
-    uint8_t metadata
-)
+// Index of the first note with frame >= `frame` (binary search).
+static uint32_t first_note_from(uint32_t frame)
 {
-    // Fade all previous Other LEDs first.
-    for (int i = 0; i < OTHER_RENDER_LENGTH; i++)
+    uint32_t low = 0;
+    uint32_t high = s_note_count;
+
+    while (low < high)
     {
-        other_led_brightness[i] =
-            fade_value(
-                other_led_brightness[i],
-                OTHER_FADE_AMOUNT
-            );
+        uint32_t mid = low + (high - low) / 2;
+
+        if (note_frame(mid) < frame)
+            low = mid + 1;
+        else
+            high = mid;
     }
 
-    bool note_detected =
-        (metadata & 0x01) != 0;
+    return low;
+}
 
-    uint8_t position =
-        (metadata >> 1) & 0x0F;
 
-    if (note_detected && position < 14 && brightness > 0)
+static void reset_other_state(void)
+{
+    memset(other_level, 0, sizeof(other_level));
+    memset(other_colour, 0, sizeof(other_colour));
+    memset(other_fade, 0, sizeof(other_fade));
+}
+
+
+// Advances the Other state to `frame_index` without drawing.
+static void update_other(uint32_t frame_index)
+{
+    // 1. Fade every lit LED by its own fade value.
+    for (int i = 0; i < OTHER_LED_COUNT; i++)
     {
-        int main_offset =
-            other_position_to_led(position);
-
-        uint8_t adjacent_brightness =
-            ((uint16_t)brightness *
-             OTHER_ADJACENT_SCALE) / 255;
-
-        raise_other_led(
-            main_offset,
-            brightness
-        );
-
-        raise_other_led(
-            main_offset - 1,
-            adjacent_brightness
-        );
-
-        raise_other_led(
-            main_offset + 1,
-            adjacent_brightness
-        );
+        if (other_level[i] > 0)
+        {
+            other_level[i] =
+                ((uint32_t)other_level[i] * (255 - other_fade[i])) / 255;
+        }
     }
 
-    for (int offset = 0; offset < OTHER_RENDER_LENGTH; offset++)
+    // 2. Start this frame's notes at full level. Notes for frames
+    // already passed (should not happen) are skipped, not applied.
+    while (s_next_note < s_note_count &&
+           note_frame(s_next_note) <= frame_index)
+    {
+        song_note_t note;
+        read_note(s_next_note, &note);
+
+        if (note.frame == frame_index && note.position < OTHER_LED_COUNT)
+        {
+            other_level[note.position] = OTHER_FULL_LEVEL;
+            other_colour[note.position] = (rgb_t){ note.r, note.g, note.b };
+            other_fade[note.position] = note.fade;
+        }
+
+        s_next_note++;
+    }
+}
+
+
+static void render_other(void)
+{
+    for (int i = 0; i < OTHER_LED_COUNT; i++)
     {
         uint8_t level =
-            ((uint16_t)other_led_brightness[offset] *
-             OTHER_BRIGHTNESS) / 255;
+            ((uint32_t)(other_level[i] >> 8) * OTHER_BRIGHTNESS) / 255;
 
-        uint8_t r =
-            ((uint16_t)OTHER_R * level) / 255;
+        set_physical_led(
+            OTHER_START + i,
+            ((uint16_t)other_colour[i].r * level) / 255,
+            ((uint16_t)other_colour[i].g * level) / 255,
+            ((uint16_t)other_colour[i].b * level) / 255
+        );
+    }
+}
 
-        uint8_t g =
-            ((uint16_t)OTHER_G * level) / 255;
 
-        uint8_t b =
-            ((uint16_t)OTHER_B * level) / 255;
+// Rebuilds the Other LEDs as they would be just before `frame`:
+// for each LED, take the last note before `frame` and apply the
+// fades of every frame since it.
+static void restore_other_state(uint32_t frame)
+{
+    reset_other_state();
 
-        set_mirrored_led(
-            OTHER_RENDER_START + offset,
+    s_next_note = first_note_from(frame);
+
+    int32_t last_note[OTHER_LED_COUNT];
+
+    for (int i = 0; i < OTHER_LED_COUNT; i++)
+        last_note[i] = -1;
+
+    for (uint32_t k = 0; k < s_next_note; k++)
+    {
+        song_note_t note;
+        read_note(k, &note);
+
+        if (note.position < OTHER_LED_COUNT)
+            last_note[note.position] = (int32_t)k;
+    }
+
+    for (int i = 0; i < OTHER_LED_COUNT; i++)
+    {
+        if (last_note[i] < 0)
+            continue;
+
+        song_note_t note;
+        read_note((uint32_t)last_note[i], &note);
+
+        // Fades are applied on the frames after the note, up to and
+        // including frame - 1. Frame `frame` fades when it is drawn.
+        uint32_t age = (frame - 1) - note.frame;
+        float factor = powf((255 - note.fade) / 255.0f, (float)age);
+
+        other_level[i] = (uint16_t)(OTHER_FULL_LEVEL * factor);
+        other_colour[i] = (rgb_t){ note.r, note.g, note.b };
+        other_fade[i] = note.fade;
+    }
+}
+
+
+// ============================================================
+// VOCALS
+// ============================================================
+//
+// The volume window [LOWER, UPPER] maps onto all 58 vocal LEDs,
+// filling upward from LED 86 in the frame's vocal colour.
+// ============================================================
+
+static uint8_t rgb555_channel(uint16_t bits, int shift)
+{
+    uint16_t value = (bits >> shift) & 0x1F;
+    return (uint8_t)((value * 255 + 15) / 31);
+}
+
+
+static void render_vocals(
+    uint16_t colour,
+    uint8_t volume
+)
+{
+    const int vocals_length = VOCAL_END - VOCAL_START + 1;
+
+    int leds_on = (int)((float)(volume - VOCALS_VOLUME_LOWER_THRESHOLD) / (VOCALS_VOLUME_UPPER_THRESHOLD - VOCALS_VOLUME_LOWER_THRESHOLD) * vocals_length);
+    if (leds_on < 0) leds_on = 0;
+    if (leds_on > vocals_length) leds_on = vocals_length;
+
+    uint8_t r = ((uint16_t)rgb555_channel(colour, 0) * VOCAL_BRIGHTNESS) / 255;
+    uint8_t g = ((uint16_t)rgb555_channel(colour, 5) * VOCAL_BRIGHTNESS) / 255;
+    uint8_t b = ((uint16_t)rgb555_channel(colour, 10) * VOCAL_BRIGHTNESS) / 255;
+
+    for (int i = 0; i < leds_on; i++)
+    {
+        set_physical_led(
+            VOCAL_START + i,
             r,
             g,
             b
@@ -775,49 +839,46 @@ static void render_other(
 
 
 // ============================================================
-// VOCAL SPECTRUM
+// RENDER ONE COMPLETE SONG FRAME
 // ============================================================
 
-static void render_vocals(
-    const uint8_t spectrum[8],
-    uint8_t volume,
-    uint8_t onset
-)
+static void reset_visual_state(void)
 {
+    kick_brightness = 0;
+    hihat_brightness = 0;
 
-    const int vocals_length = VOCAL_END - VOCAL_START + 1;
-
-    // I want the number of LEDs on to equal VOCALS_LENGTH when the volume equals 230 and I want leds_on to equal 0 when volume equals 153
-    int leds_on = (int)((float)(volume - VOCALS_VOLUME_LOWER_THRESHOLD) / (VOCALS_VOLUME_UPPER_THRESHOLD - VOCALS_VOLUME_LOWER_THRESHOLD) * vocals_length);
-    if (leds_on < 0) leds_on = 0;
-    if (leds_on > vocals_length) leds_on = vocals_length;
-
-    for (int i = 0; i < leds_on; i++)
-    {
-        set_mirrored_led(
-            VOCAL_END - i,
-            ((uint16_t)VOCAL_R * VOCAL_BRIGHTNESS) / 255,
-            ((uint16_t)VOCAL_G * VOCAL_BRIGHTNESS) / 255,
-            ((uint16_t)VOCAL_B * VOCAL_BRIGHTNESS) / 255
-        );
-    }
-
+    reset_other_state();
 }
 
 
-// ============================================================
-// RENDER ONE COMPLETE AUDIO FRAME
-// ============================================================
-
-static void render_frame(
-    const audio_frame_t *frame
+// Advances drums and Other to `frame_index` without drawing.
+static void update_state(
+    const song_frame_t *frame,
+    uint32_t frame_index
 )
 {
+    update_drums(
+        decode_drums(frame->drums)
+    );
+
+    update_other(
+        frame_index
+    );
+}
+
+
+static void render_frame(
+    const song_frame_t *frame,
+    uint32_t frame_index
+)
+{
+    update_state(
+        frame,
+        frame_index
+    );
+
+
     clear_led_buffer();
-
-
-    drum_data_t drums =
-        decode_drums(frame->drums);
 
 
     render_bass(
@@ -825,21 +886,15 @@ static void render_frame(
     );
 
 
-    render_drums(
-        drums
-    );
+    render_drums();
 
 
-    render_other(
-        frame->other_brightness,
-        frame->other_metadata
-    );
+    render_other();
 
 
     render_vocals(
-        frame->vocals_spectrum,
-        frame->vocals_volume,
-        frame->vocals_onset
+        frame->vocal_colour,
+        frame->vocal_volume
     );
 
 
@@ -871,9 +926,9 @@ static void render_idle_animation(int64_t elapsed_us)
 
         set_mirrored_led(
             i,
-            ((uint16_t)OTHER_R * level) / 255,
-            ((uint16_t)OTHER_G * level) / 255,
-            ((uint16_t)OTHER_B * level) / 255
+            ((uint16_t)IDLE_R * level) / 255,
+            ((uint16_t)IDLE_G * level) / 255,
+            ((uint16_t)IDLE_B * level) / 255
         );
     }
 
@@ -894,9 +949,9 @@ static void render_transfer_animation(int64_t elapsed_us)
     {
         set_mirrored_led(
             i,
-            ((uint16_t)VOCAL_R * TRANSFER_BRIGHTNESS) / 255,
-            ((uint16_t)VOCAL_G * TRANSFER_BRIGHTNESS) / 255,
-            ((uint16_t)VOCAL_B * TRANSFER_BRIGHTNESS) / 255
+            ((uint16_t)TRANSFER_R * TRANSFER_BRIGHTNESS) / 255,
+            ((uint16_t)TRANSFER_G * TRANSFER_BRIGHTNESS) / 255,
+            ((uint16_t)TRANSFER_B * TRANSFER_BRIGHTNESS) / 255
         );
     }
 
@@ -909,9 +964,9 @@ static void render_transfer_animation(int64_t elapsed_us)
 
         set_mirrored_led(
             filled,
-            ((uint16_t)VOCAL_R * level) / 255,
-            ((uint16_t)VOCAL_G * level) / 255,
-            ((uint16_t)VOCAL_B * level) / 255
+            ((uint16_t)TRANSFER_R * level) / 255,
+            ((uint16_t)TRANSFER_G * level) / 255,
+            ((uint16_t)TRANSFER_B * level) / 255
         );
     }
 
@@ -920,19 +975,22 @@ static void render_transfer_animation(int64_t elapsed_us)
 
 
 // ============================================================
-// PLAYBACK HELPERS
+// SONG FILE ACCESS
 // ============================================================
 
-static void reset_visual_state(void)
+static bool seek_file_to_frame(uint32_t frame)
 {
-    kick_brightness = 0;
-    hihat_brightness = 0;
+    long offset =
+        (long)sizeof(song_header_t) +
+        (long)frame * SONG_FRAME_SIZE;
 
-    memset(
-        other_led_brightness,
-        0,
-        sizeof(other_led_brightness)
-    );
+    return fseek(s_file, offset, SEEK_SET) == 0;
+}
+
+
+static bool read_frame(song_frame_t *frame)
+{
+    return fread(frame, sizeof(*frame), 1, s_file) == 1;
 }
 
 
@@ -944,8 +1002,13 @@ static void close_file(void)
         s_file = NULL;
     }
 
+    free(s_notes);
+    s_notes = NULL;
+
     memset(s_loaded_track, 0, sizeof(s_loaded_track));
     s_total_frames = 0;
+    s_note_count = 0;
+    s_next_note = 0;
     s_frame = 0;
 }
 
@@ -958,35 +1021,72 @@ static void start_animation(renderer_mode_t mode)
 }
 
 
-// Moves the open file to `frame` and re-anchors the frame clock so
-// `frame` is displayed immediately. Fade state is reset because the
-// previous frames no longer lead into this one.
-static void position_playback(uint32_t frame, bool playing)
+// Restores all fade state to what it would be just before `frame`
+// and positions the file there.
+static bool restore_state(uint32_t frame)
 {
     reset_visual_state();
 
-    if (frame >= s_total_frames ||
-        fseek(s_file, (long)frame * AUDIO_FRAME_SIZE, SEEK_SET) != 0)
+    // Drums: replay the preceding frames without drawing.
+    uint32_t start = (frame > DRUM_REPLAY_FRAMES) ? frame - DRUM_REPLAY_FRAMES : 0;
+
+    if (start < frame && seek_file_to_frame(start))
     {
-        s_frame = s_total_frames;
-        s_mode = RENDERER_ENDED;
-        clear_strip();
+        song_frame_t replay;
+
+        for (uint32_t i = start; i < frame && read_frame(&replay); i++)
+        {
+            update_drums(
+                decode_drums(replay.drums)
+            );
+        }
+    }
+
+    // Other: rebuild each LED from its last note.
+    restore_other_state(frame);
+
+    return seek_file_to_frame(frame);
+}
+
+
+static void end_song(void)
+{
+    s_frame = s_total_frames;
+    s_mode = RENDERER_ENDED;
+    clear_strip();
+}
+
+
+// Moves playback to `frame` with the fade state rebuilt. When not
+// playing, `frame` is drawn once and frozen on the strip.
+static void position_playback(uint32_t frame, bool playing)
+{
+    if (frame >= s_total_frames || !restore_state(frame))
+    {
+        end_song();
         return;
     }
 
     s_frame = frame;
-    s_anchor_frame = frame;
-    s_anchor_time_us = esp_timer_get_time();
 
     if (playing)
     {
+        s_anchor_frame = frame;
+        s_anchor_time_us = esp_timer_get_time();
         s_mode = RENDERER_PLAYING;
+        return;
     }
+
+    song_frame_t still;
+
+    if (read_frame(&still))
+        render_frame(&still, frame);
     else
-    {
-        s_mode = RENDERER_PAUSED;
         clear_strip();
-    }
+
+    // The file and state are now one frame ahead, but resuming
+    // always restores state first, so that does not matter.
+    s_mode = RENDERER_PAUSED;
 }
 
 
@@ -1002,37 +1102,66 @@ static bool open_track(const rcmd_t *cmd)
     if (s_file == NULL)
     {
         ESP_LOGE(TAG, "Could not open %s", path);
-        s_mode = RENDERER_OFF;
-        clear_strip();
-        return false;
+        goto fail;
     }
 
     fseek(s_file, 0, SEEK_END);
     long file_size = ftell(s_file);
+    rewind(s_file);
 
-    if (file_size % AUDIO_FRAME_SIZE != 0)
+    song_header_t header;
+
+    if (fread(&header, sizeof(header), 1, s_file) != 1 ||
+        !song_header_is_valid(&header, (uint32_t)file_size))
     {
-        ESP_LOGW(
-            TAG,
-            "File size is not a multiple of %d bytes",
-            AUDIO_FRAME_SIZE
-        );
+        ESP_LOGE(TAG, "%s is not a valid song file", path);
+        goto fail;
     }
 
-    s_total_frames = file_size / AUDIO_FRAME_SIZE;
+    s_total_frames = header.frame_count;
+    s_note_count = header.note_count;
+
+    // Load the notes into RAM (a few KB per song).
+    if (s_note_count > 0)
+    {
+        size_t notes_size = s_note_count * SONG_NOTE_SIZE;
+
+        s_notes = malloc(notes_size);
+
+        if (s_notes == NULL)
+        {
+            ESP_LOGE(TAG, "Not enough memory for %lu notes", (unsigned long)s_note_count);
+            goto fail;
+        }
+
+        if (!seek_file_to_frame(s_total_frames) ||
+            fread(s_notes, 1, notes_size, s_file) != notes_size)
+        {
+            ESP_LOGE(TAG, "Could not read notes from %s", path);
+            goto fail;
+        }
+    }
+
     memcpy(s_loaded_track, cmd->track_id, TRACK_ID_LEN);
 
     ESP_LOGI(
         TAG,
-        "Opened %.22s: %lu frames, starting at frame %lu (%s)",
+        "Opened %.22s: %lu frames, %lu notes, starting at frame %lu (%s)",
         cmd->track_id,
         (unsigned long)s_total_frames,
+        (unsigned long)s_note_count,
         (unsigned long)cmd->frame,
         cmd->playing ? "playing" : "paused"
     );
 
     position_playback(cmd->frame, cmd->playing);
     return true;
+
+fail:
+    close_file();
+    s_mode = RENDERER_OFF;
+    clear_strip();
+    return false;
 }
 
 
@@ -1055,12 +1184,17 @@ static bool handle_command(const rcmd_t *cmd)
         position_playback(cmd->frame, true);
         return true;
 
+    case RCMD_STILL:
+        if (s_file == NULL)
+            return false;
+
+        position_playback(cmd->frame, false);
+        return true;
+
     case RCMD_PAUSE:
+        // Freeze: the last frame stays on the strip.
         if (s_mode == RENDERER_PLAYING)
-        {
             s_mode = RENDERER_PAUSED;
-            clear_strip();
-        }
         return true;
 
     case RCMD_IDLE:
@@ -1116,42 +1250,65 @@ static void play_next_frame(void)
 {
     int64_t now = esp_timer_get_time();
 
-    // Skip ahead if we fell badly behind instead of fast-forwarding.
     uint32_t due =
         s_anchor_frame +
         (uint32_t)((now - s_anchor_time_us) / FRAME_PERIOD_US);
+
+    song_frame_t frame;
+
+    // --------------------------------------------------------
+    // Fell behind: catch up without drawing the missed frames.
+    // --------------------------------------------------------
 
     if (due > s_frame + MAX_LATE_FRAMES)
     {
         ESP_LOGW(
             TAG,
-            "Renderer %lu frames late, skipping ahead",
+            "Renderer %lu frames late, catching up",
             (unsigned long)(due - s_frame)
         );
 
-        if (due >= s_total_frames ||
-            fseek(s_file, (long)due * AUDIO_FRAME_SIZE, SEEK_SET) != 0)
+        if (due >= s_total_frames)
         {
-            s_frame = s_total_frames;
-            s_mode = RENDERER_ENDED;
-            clear_strip();
+            end_song();
             return;
         }
 
-        s_frame = due;
+        if (due - s_frame <= MAX_CATCH_UP_FRAMES)
+        {
+            // Step the fade state through the missed frames so held
+            // notes and fades stay exact.
+            for (; s_frame < due; s_frame++)
+            {
+                if (!read_frame(&frame))
+                {
+                    end_song();
+                    return;
+                }
+
+                update_state(&frame, s_frame);
+            }
+        }
+        else
+        {
+            if (!restore_state(due))
+            {
+                end_song();
+                return;
+            }
+
+            s_frame = due;
+        }
     }
 
-    audio_frame_t frame;
-
-    if (fread(&frame, sizeof(frame), 1, s_file) != 1)
+    if (!read_frame(&frame))
     {
         ESP_LOGI(TAG, "Visualisation finished");
-        s_mode = RENDERER_ENDED;
-        clear_strip();
+        end_song();
         return;
     }
 
-    render_frame(&frame);
+    render_frame(&frame, s_frame);
     s_frame++;
 }
 
@@ -1284,6 +1441,13 @@ bool renderer_open(const char *track_id, uint32_t start_frame, bool playing)
 void renderer_seek(uint32_t frame)
 {
     rcmd_t cmd = { .type = RCMD_SEEK, .frame = frame };
+    send_command(&cmd);
+}
+
+
+void renderer_show_still(uint32_t frame)
+{
+    rcmd_t cmd = { .type = RCMD_STILL, .frame = frame };
     send_command(&cmd);
 }
 

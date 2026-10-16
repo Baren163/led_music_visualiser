@@ -12,7 +12,7 @@ typedef enum
     RENDERER_IDLE,          // idle animation, no file
     RENDERER_TRANSFER,      // file transfer progress bar, no file
     RENDERER_PLAYING,       // file open, frames advancing
-    RENDERER_PAUSED,        // file open, strip dark
+    RENDERER_PAUSED,        // file open, last frame frozen on the strip
     RENDERER_ENDED,         // file open, position past the last frame
 
 } renderer_mode_t;
@@ -27,6 +27,10 @@ void renderer_init(void);
 
 bool renderer_open(const char *track_id, uint32_t start_frame, bool playing);
 void renderer_seek(uint32_t frame);
+
+// Draws `frame` once and freezes it (seeking while paused).
+void renderer_show_still(uint32_t frame);
+
 void renderer_pause(void);
 void renderer_resume(uint32_t frame);
 void renderer_idle(void);

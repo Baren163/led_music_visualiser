@@ -233,6 +233,7 @@ static void apply_state(const msg_state_t *m)
         // ----------------------------------------------------
 
         renderer_mode_t mode = renderer_get_mode();
+        int32_t drift = (int32_t)target_frame - (int32_t)renderer_get_frame();
 
         if (!playing)
         {
@@ -240,6 +241,13 @@ static void apply_state(const msg_state_t *m)
             {
                 ESP_LOGI(TAG, "Paused");
                 renderer_pause();
+            }
+            else if ((mode == RENDERER_PAUSED || mode == RENDERER_ENDED) &&
+                     abs(drift) > DRIFT_THRESHOLD_FRAMES)
+            {
+                // Scrubbed while paused: freeze the new position instead.
+                ESP_LOGI(TAG, "Paused seek to frame %lu", (unsigned long)target_frame);
+                renderer_show_still(target_frame);
             }
         }
         else if (mode == RENDERER_PAUSED || mode == RENDERER_ENDED)
@@ -251,8 +259,6 @@ static void apply_state(const msg_state_t *m)
         }
         else if (mode == RENDERER_PLAYING)
         {
-            int32_t drift = (int32_t)target_frame - (int32_t)renderer_get_frame();
-
             if (abs(drift) > DRIFT_THRESHOLD_FRAMES)
             {
                 ESP_LOGI(

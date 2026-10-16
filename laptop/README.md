@@ -53,18 +53,31 @@ Options:
 | Option | Purpose |
 |---|---|
 | `--offset N` | Set the latency offset (ms) on the ESP32 when it connects |
-| `--add BIN TRACK` | Copy a generated `.bin` into `songs/`, named by track ID |
+| `--add FOLDER TRACK` | Copy a `generate_song_vis.py` output folder into `songs/<track_id>/` |
 | `-v` | Debug logging |
 
 ## 4. Song files
 
-Files go in `songs/` and are named by Spotify track ID:
-`songs/4uLU6hMCjMI75M1A2tKUQC.bin`. To get the ID, choose **Share → Copy song link**
-in Spotify. The ID is the part after `/track/`. `--add` accepts the whole link:
+Each song is a folder named by Spotify track ID, holding the two files
+`generate_song_vis.py` writes:
+
+```
+songs/4uLU6hMCjMI75M1A2tKUQC/
+    led_visualisation_data.bin    6 bytes per frame (bass, drums, vocals)
+    led_other_notes.bin           7 bytes per note (the "other" notes)
+```
+
+To get the ID, choose **Share → Copy song link** in Spotify. The ID is the part
+after `/track/`. `--add` takes the generator's song folder and the whole link:
 
 ```bash
-python visualiser_link.py --add ../path/to/song.bin "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC?si=..."
+python visualiser_link.py --add "../Audio Frequency Visualiser/separated/htdemucs/rebel_city" "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC?si=..."
 ```
+
+When the ESP32 needs a song, the laptop packs both files into a single container
+(12-byte `LVS2` header + frames + notes; see `main/protocol.h`) and sends that.
+The ESP32 caches it as `/storage/<track_id>.lvs`. Old single-file `.bin` songs
+from the previous format are deleted from the ESP32 automatically at boot.
 
 ## 5. Latency tuning
 
@@ -92,7 +105,8 @@ The offset is saved in the ESP32's NVS and survives reboots.
 | Playing, file cached | Visualisation |
 | Playing, no file / podcast / transfer pending | Idle wave |
 | File transfer in progress | Progress bar filling from both ends |
-| Paused, or nothing playing | Off |
+| Paused | Last frame frozen (scrubbing while paused updates it) |
+| Song finished, or nothing playing | Off |
 | No message from the laptop for 15 s | Off |
 
 ## Protocol summary

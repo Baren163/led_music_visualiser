@@ -26,6 +26,10 @@
 
 #define WRITE_BUFFER_SIZE   2048
 
+// Cached songs are stored as /storage/<track_id>.lvs (song container).
+#define SONG_EXTENSION      ".lvs"
+#define OLD_FILES_MAX       16
+
 // Song cache index. Stored in NVS (wear-levelled, atomic writes) rather
 // than in a file on the song partition.
 #define LRU_MAX_ENTRIES     64
@@ -176,6 +180,28 @@ static void evict_entry(int index)
 }
 
 
+static bool file_has_valid_header(const char *path)
+{
+    struct stat st;
+
+    if (stat(path, &st) != 0)
+        return false;
+
+    FILE *file = fopen(path, "rb");
+
+    if (file == NULL)
+        return false;
+
+    song_header_t header;
+    bool ok =
+        fread(&header, sizeof(header), 1, file) == 1 &&
+        song_header_is_valid(&header, (uint32_t)st.st_size);
+
+    fclose(file);
+    return ok;
+}
+
+
 // Rebuilds the index from the files that actually exist on the
 // partition, keeping last-used values saved in NVS where possible.
 static void lru_rebuild(void)
@@ -200,6 +226,11 @@ static void lru_rebuild(void)
 
     bool found_tmp = false;
 
+    // Files from the old single-format firmware (<id>.bin), deleted
+    // after the directory listing is closed.
+    char old_files[OLD_FILES_MAX][TRACK_ID_LEN + 5];
+    int old_count = 0;
+
     DIR *dir = opendir(STORAGE_BASE);
 
     if (dir == NULL)
@@ -220,10 +251,20 @@ static void lru_rebuild(void)
             continue;
         }
 
-        bool is_track_file =
+        bool is_named_like_track =
             strlen(name) == TRACK_ID_LEN + 4 &&
-            strcmp(name + TRACK_ID_LEN, ".bin") == 0 &&
             track_id_is_valid(name);
+
+        if (is_named_like_track && strcmp(name + TRACK_ID_LEN, ".bin") == 0)
+        {
+            if (old_count < OLD_FILES_MAX)
+                strcpy(old_files[old_count++], name);
+            continue;
+        }
+
+        bool is_track_file =
+            is_named_like_track &&
+            strcmp(name + TRACK_ID_LEN, SONG_EXTENSION) == 0;
 
         if (!is_track_file)
         {
@@ -259,6 +300,29 @@ static void lru_rebuild(void)
     // A leftover temp file means a transfer was interrupted by a reset.
     if (found_tmp)
         unlink(TMP_PATH);
+
+    for (int i = 0; i < old_count; i++)
+    {
+        char path[48];
+        snprintf(path, sizeof(path), STORAGE_BASE "/%s", old_files[i]);
+
+        ESP_LOGI(TAG, "Deleting old-format song file %s", old_files[i]);
+        unlink(path);
+    }
+
+    // Drop cached songs whose header is invalid (e.g. a format change).
+    for (int i = s_lru_count - 1; i >= 0; i--)
+    {
+        char path[48];
+        storage_track_path(s_lru[i].track_id, path, sizeof(path));
+
+        if (!file_has_valid_header(path))
+        {
+            ESP_LOGW(TAG, "Deleting invalid song file %.22s", s_lru[i].track_id);
+            unlink(path);
+            lru_remove(i);
+        }
+    }
 
     lru_save();
 
@@ -336,7 +400,7 @@ esp_err_t storage_init(void)
 
 void storage_track_path(const char *track_id, char *out, size_t out_len)
 {
-    snprintf(out, out_len, STORAGE_BASE "/%.22s.bin", track_id);
+    snprintf(out, out_len, STORAGE_BASE "/%.22s" SONG_EXTENSION, track_id);
 }
 
 
@@ -414,7 +478,7 @@ uint8_t storage_xfer_begin(const char *track_id, uint32_t total_size, uint32_t c
     if (!track_id_is_valid(track_id))
         return PROTO_ERR_BAD_MESSAGE;
 
-    if (total_size == 0 || total_size % AUDIO_FRAME_SIZE != 0)
+    if (total_size < sizeof(song_header_t))
         return PROTO_ERR_BAD_SIZE;
 
     // Replace any existing copy of this track.
@@ -542,6 +606,11 @@ uint8_t storage_xfer_end(void)
         );
 
         err = PROTO_ERR_CRC_MISMATCH;
+    }
+    else if (!file_has_valid_header(TMP_PATH))
+    {
+        ESP_LOGE(TAG, "Received file is not a valid song container");
+        err = PROTO_ERR_BAD_FORMAT;
     }
     else
     {

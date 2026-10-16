@@ -23,9 +23,80 @@
 
 #define TRACK_ID_LEN            22      // Spotify base62 track ID
 
-#define AUDIO_FRAME_SIZE        14      // bytes per visualisation frame
 #define FRAME_RATE_HZ           25
 #define FRAME_PERIOD_MS         (1000 / FRAME_RATE_HZ)
+
+
+// ============================================================
+// SONG CONTAINER FILE
+// ============================================================
+//
+// The laptop packs the generator's two binaries into one file so a
+// song is transferred, CRC-checked and cached as a single unit:
+//
+//   song_header_t             12 bytes
+//   frames[frame_count]        6 bytes each  (led_visualisation_data.bin)
+//   notes[note_count]          7 bytes each  (led_other_notes.bin)
+//
+// Frame layout (6 bytes):
+//   byte 0      bass volume 0-255
+//   byte 1      drums: bit0 kick, bit1 hi-hat,
+//               bits2-4 kick intensity, bits5-7 hi-hat intensity
+//   bytes 2-3   vocal colour, uint16 RGB555
+//               (bits0-4 red, bits5-9 green, bits10-14 blue)
+//   byte 4      vocal volume 0-255
+//   byte 5      vocal onset 0-255 (unused)
+//
+// Note layout (7 bytes, sorted by frame then position):
+//   bytes 0-1   frame the note starts on (uint16)
+//   byte 2      position 0-47 in the Other section
+//   bytes 3-5   red, green, blue
+//   byte 6      fade: each later frame, level *= (255 - fade) / 255
+// ============================================================
+
+#define SONG_MAGIC              "LVS2"
+#define SONG_FORMAT_VERSION     1
+
+#define SONG_FRAME_SIZE         6
+#define SONG_NOTE_SIZE          7
+
+// Notes are loaded into RAM while a song plays (~63 KB at this limit).
+#define SONG_MAX_NOTES          9000
+
+
+typedef struct __attribute__((packed))
+{
+    char     magic[4];                  // SONG_MAGIC
+    uint8_t  version;                   // SONG_FORMAT_VERSION
+    uint8_t  reserved;
+    uint16_t note_count;
+    uint32_t frame_count;
+
+} song_header_t;
+
+_Static_assert(sizeof(song_header_t) == 12, "song_header_t must be 12 bytes");
+
+
+// True if the header is valid and describes a file of exactly `file_size` bytes.
+static inline bool song_header_is_valid(const song_header_t *h, uint32_t file_size)
+{
+    if (h->magic[0] != SONG_MAGIC[0] || h->magic[1] != SONG_MAGIC[1] ||
+        h->magic[2] != SONG_MAGIC[2] || h->magic[3] != SONG_MAGIC[3])
+        return false;
+
+    if (h->version != SONG_FORMAT_VERSION)
+        return false;
+
+    if (h->frame_count == 0 || h->note_count > SONG_MAX_NOTES)
+        return false;
+
+    uint64_t expected =
+        sizeof(song_header_t) +
+        (uint64_t)h->frame_count * SONG_FRAME_SIZE +
+        (uint64_t)h->note_count * SONG_NOTE_SIZE;
+
+    return expected == file_size;
+}
 
 
 // ------------------------------------------------------------
@@ -117,6 +188,7 @@ typedef enum
     PROTO_ERR_RENAME        = 10,
     PROTO_ERR_TIMEOUT       = 11,
     PROTO_ERR_ABORTED       = 12,
+    PROTO_ERR_BAD_FORMAT    = 13,       // song container header invalid
 
 } proto_error_t;
 

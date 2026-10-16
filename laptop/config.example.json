@@ -1,8 +1,0 @@
-{
-  "spotify_client_id": "YOUR_CLIENT_ID",
-  "spotify_client_secret": "YOUR_CLIENT_SECRET",
-  "spotify_redirect_uri": "http://127.0.0.1:8888/callback",
-  "songs_dir": "songs",
-  "ble_device_name": "LED-Visualiser",
-  "poll_interval_s": 1.0
-}

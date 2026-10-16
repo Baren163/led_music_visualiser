@@ -8,8 +8,9 @@ LED controller in sync over Bluetooth LE:
     iPhone (Spotify) --> Spotify cloud <-- this script --BLE--> ESP32-C3 --> LEDs
 
 * Sends a STATE message (track ID, playing flag, position) every poll.
-* If the ESP32 does not have the current track cached, sends
-  songs/<spotify_track_id>.bin over BLE.
+* If the ESP32 does not have the current track cached, packs the two
+  generator outputs in songs/<spotify_track_id>/ into one song container
+  and sends it over BLE.
 * Reconnects automatically when the BLE link drops.
 
 While running, type into the console:
@@ -67,7 +68,18 @@ FLAG_PLAYING = 0x01
 FLAG_FILE_AVAILABLE = 0x02
 
 TRACK_ID_LEN = 22
-AUDIO_FRAME_SIZE = 14
+
+# Song container: header + frames + notes (see protocol.h)
+SONG_MAGIC = b"LVS2"
+SONG_FORMAT_VERSION = 1
+SONG_HEADER_FORMAT = "<4sBBHI"      # magic, version, reserved, note_count, frame_count (12 bytes)
+SONG_FRAME_SIZE = 6
+SONG_NOTE_SIZE = 7
+SONG_MAX_NOTES = 9000
+
+# Files written by generate_song_vis.py, kept in songs/<track_id>/
+FRAMES_FILENAME = "led_visualisation_data.bin"
+NOTES_FILENAME = "led_other_notes.bin"
 
 STATE_FORMAT = "<B22sBIH"           # 30 bytes
 SET_OFFSET_FORMAT = "<Bh"           # 3 bytes
@@ -96,6 +108,7 @@ ERROR_NAMES = {
     10: "rename failed",
     11: "timeout",
     12: "aborted",
+    13: "invalid song file",
 }
 
 TRACK_ID_RE = re.compile(r"^[0-9A-Za-z]{22}$")
@@ -162,6 +175,47 @@ def encode_track_id(track_id: Optional[str]) -> bytes:
     if not track_id:
         return b"\0" * TRACK_ID_LEN
     return track_id.encode("ascii")[:TRACK_ID_LEN].ljust(TRACK_ID_LEN, b"\0")
+
+
+def check_song_folder(folder: Path) -> Optional[str]:
+    """Returns why the generator output in `folder` is unusable, or None if it is fine."""
+    frames = folder / FRAMES_FILENAME
+    notes = folder / NOTES_FILENAME
+
+    for path in (frames, notes):
+        if not path.is_file():
+            return f"{path.name} is missing"
+
+    frames_size = frames.stat().st_size
+    notes_size = notes.stat().st_size
+
+    if frames_size == 0 or frames_size % SONG_FRAME_SIZE != 0:
+        return f"{frames.name} is {frames_size} bytes, not a multiple of {SONG_FRAME_SIZE}"
+
+    if notes_size % SONG_NOTE_SIZE != 0:
+        return f"{notes.name} is {notes_size} bytes, not a multiple of {SONG_NOTE_SIZE}"
+
+    if notes_size // SONG_NOTE_SIZE > SONG_MAX_NOTES:
+        return f"{notes.name} has more than {SONG_MAX_NOTES} notes"
+
+    return None
+
+
+def pack_song(folder: Path) -> bytes:
+    """Packs the two generator binaries into one song container."""
+    frames = (folder / FRAMES_FILENAME).read_bytes()
+    notes = (folder / NOTES_FILENAME).read_bytes()
+
+    header = struct.pack(
+        SONG_HEADER_FORMAT,
+        SONG_MAGIC,
+        SONG_FORMAT_VERSION,
+        0,
+        len(notes) // SONG_NOTE_SIZE,
+        len(frames) // SONG_FRAME_SIZE,
+    )
+
+    return header + frames + notes
 
 
 # ============================================================
@@ -606,7 +660,7 @@ class Bridge:
         if playback.track_id is None:
             log.info("Now playing: %s", playback.title or "nothing")
         else:
-            has_file = self._song_path(playback.track_id) is not None
+            has_file = self._song_folder(playback.track_id) is not None
             log.info(
                 "Now playing: %s [%s] %s",
                 playback.title,
@@ -618,24 +672,25 @@ class Bridge:
     # ESP32 sync
     # --------------------------------------------------------
 
-    def _song_path(self, track_id: Optional[str]) -> Optional[Path]:
+    def _song_folder(self, track_id: Optional[str]) -> Optional[Path]:
+        """songs/<track_id>/ if it holds valid generator output."""
         if not track_id:
             return None
 
-        path = self.songs_dir / f"{track_id}.bin"
+        folder = self.songs_dir / track_id
 
-        if not path.is_file():
+        if not folder.is_dir():
             return None
 
-        size = path.stat().st_size
+        problem = check_song_folder(folder)
 
-        if size == 0 or size % AUDIO_FRAME_SIZE != 0:
+        if problem is not None:
             if track_id not in self._warned_bad_files:
-                log.warning("%s is %d bytes, not a multiple of %d; ignoring it", path.name, size, AUDIO_FRAME_SIZE)
+                log.warning("Ignoring songs/%s: %s", track_id, problem)
                 self._warned_bad_files.add(track_id)
             return None
 
-        return path
+        return folder
 
     async def _sync_loop(self) -> None:
         while True:
@@ -652,18 +707,18 @@ class Bridge:
 
     async def _send_current_state(self) -> int:
         pb = self.playback
-        path = self._song_path(pb.track_id)
+        folder = self._song_folder(pb.track_id)
 
         return await self.link.send_state(
             pb.track_id,
             pb.playing,
-            path is not None,
+            folder is not None,
             pb.position_ms(),
         )
 
     async def _sync_once(self) -> None:
         track_id = self.playback.track_id
-        path = self._song_path(track_id)
+        folder = self._song_folder(track_id)
 
         seq = await self._send_current_state()
         status = await self.link.wait_status(lambda s: s.ack_seq == seq, timeout=1.0)
@@ -673,14 +728,14 @@ class Bridge:
             return
 
         # Does the ESP32 need the file?
-        if path is None or status.track_id == track_id:
+        if folder is None or status.track_id == track_id:
             return
 
         if self._failures.get(track_id, 0) >= MAX_TRANSFER_ATTEMPTS:
             return
 
-        data = path.read_bytes()
-        log.info("Sending %s (%d bytes, %d byte chunks)", path.name, len(data), self.link.chunk_size)
+        data = pack_song(folder)
+        log.info("Sending %s (%d bytes, %d byte chunks)", track_id, len(data), self.link.chunk_size)
 
         ok = await self.link.transfer_file(
             track_id,
@@ -774,17 +829,20 @@ def parse_track_id(text: str) -> str:
 
 
 def add_song(cfg: dict, base_dir: Path, source: Path, track: str) -> None:
+    """Copies a generator song folder's two binaries into songs/<track_id>/."""
     track_id = parse_track_id(track)
-    size = source.stat().st_size
 
-    if size == 0 or size % AUDIO_FRAME_SIZE != 0:
-        raise SystemExit(f"{source} is {size} bytes, not a multiple of {AUDIO_FRAME_SIZE}")
+    problem = check_song_folder(source)
 
-    songs_dir = (base_dir / cfg.get("songs_dir", "songs")).resolve()
-    songs_dir.mkdir(parents=True, exist_ok=True)
+    if problem is not None:
+        raise SystemExit(f"{source}: {problem}")
 
-    dest = songs_dir / f"{track_id}.bin"
-    shutil.copyfile(source, dest)
+    dest = (base_dir / cfg.get("songs_dir", "songs")).resolve() / track_id
+    dest.mkdir(parents=True, exist_ok=True)
+
+    for name in (FRAMES_FILENAME, NOTES_FILENAME):
+        shutil.copyfile(source / name, dest / name)
+
     print(f"Copied {source} -> {dest}")
 
 
@@ -805,8 +863,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Sync the LED visualiser with Spotify over BLE.")
     parser.add_argument("--config", type=Path, default=base_dir / "config.json")
     parser.add_argument("--offset", type=int, help="set the latency offset (ms) on the ESP32 when connecting")
-    parser.add_argument("--add", nargs=2, metavar=("BIN_FILE", "SPOTIFY_TRACK"),
-                        help="copy a generated .bin into the songs folder, named by track ID, and exit")
+    parser.add_argument("--add", nargs=2, metavar=("SONG_FOLDER", "SPOTIFY_TRACK"),
+                        help="copy a generate_song_vis.py output folder into songs/<track_id>/ and exit")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 

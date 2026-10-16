@@ -80,3 +80,4 @@ Desktop.ini
 # Laptop bridge
 laptop/config.json
 laptop/.spotify_cache
+laptop/*.json
